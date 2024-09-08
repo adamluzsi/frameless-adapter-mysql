@@ -3,8 +3,6 @@ package mysql
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -376,69 +374,13 @@ func (r Repository[Entity, ID]) Upsert(ctx context.Context, entities ...*Entity)
 	return nil
 }
 
-type DTO interface {
-	driver.Valuer
-	sql.Scanner
+// Timestamp is a MySQL DTO Model for the timestamp type mapping.
+// Use it from your scan and argument mapping.
+func Timestamp(ptr *time.Time) flsql.DTO {
+	const layout = "2006-01-02 15:04:05"
+	return flsql.Timestamp(ptr, layout, time.UTC)
 }
 
-func Timestamp(pointer *time.Time) DTO {
-	return &dtoTimestamp{Pointer: pointer}
-}
-
-// Timestamp is a MySQL DTO Model that you can use in your entityo to query argument mapping.
-type dtoTimestamp struct{ Pointer *time.Time }
-
-const timestampLayout = "2006-01-02 15:04:05"
-
-func (m *dtoTimestamp) Scan(value any) error {
-	if value == nil {
-		return nil
-	}
-	switch value := value.(type) {
-	case []byte:
-		timestamp, err := time.Parse(timestampLayout, string(value))
-		if err != nil {
-			return err
-		}
-		*m.Pointer = timestamp
-		return nil
-	default:
-		return fmt.Errorf("%T is not yet supported for %T", value, dtoTimestamp{})
-	}
-}
-
-func (m *dtoTimestamp) Value() (driver.Value, error) {
-	if m.Pointer == nil {
-		return nil, nil
-	}
-	return m.Pointer.UTC().Format(timestampLayout), nil
-}
-
-func JSON[T any](pointer *T) DTO {
-	return &dtoJSON[T]{Pointer: pointer}
-}
-
-type dtoJSON[T any] struct{ Pointer *T }
-
-func (m dtoJSON[T]) Value() (driver.Value, error) {
-	if m.Pointer == nil {
-		return nil, nil
-	}
-	return json.Marshal(*m.Pointer)
-}
-
-func (m *dtoJSON[T]) Scan(value any) error {
-	if value == nil {
-		return nil
-	}
-	var data json.RawMessage
-	switch value := value.(type) {
-	case []byte:
-		data = value
-	case string:
-		data = []byte(value)
-	default:
-		return fmt.Errorf("%T is not yet supported for %T", value, m)
-	}
-	return json.Unmarshal(data, &m.Pointer)
+func JSON[T any](ptr *T) flsql.DTO {
+	return flsql.JSON[T](ptr)
 }
