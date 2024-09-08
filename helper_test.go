@@ -2,7 +2,6 @@ package mysql_test
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"testing"
 
@@ -18,14 +17,14 @@ import (
 )
 
 var (
-	Connection      flsql.Connection
+	Connection      mysql.Connection
 	mutexConnection sync.Mutex
 )
 
-func GetConnection(tb testing.TB) flsql.Connection {
+func GetConnection(tb testing.TB) mysql.Connection {
 	mutexConnection.Lock()
 	defer mutexConnection.Unlock()
-	if Connection != nil {
+	if !zerokit.IsZero(Connection) {
 		return Connection
 	}
 	cm, err := mysql.Connect(DatabaseDSN(tb))
@@ -76,12 +75,12 @@ var FooMapping = flsql.Mapping[testent.Foo, testent.FooID]{
 
 	ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[testent.Foo]) {
 		return []flsql.ColumnName{"id", "foo", "bar", "baz"},
-			func(f *testent.Foo, sf flsql.ScanFunc) error {
-				return sf(&f.ID, &f.Foo, &f.Bar, &f.Baz)
+			func(f *testent.Foo, s flsql.Scanner) error {
+				return s.Scan(&f.ID, &f.Foo, &f.Bar, &f.Baz)
 			}
 	},
 
-	ToID: func(id testent.FooID) (map[flsql.ColumnName]any, error) {
+	QueryID: func(id testent.FooID) (map[flsql.ColumnName]any, error) {
 		return map[flsql.ColumnName]any{"id": id}, nil
 	},
 
@@ -101,7 +100,7 @@ var FooMapping = flsql.Mapping[testent.Foo, testent.FooID]{
 		return nil
 	},
 
-	GetID: func(f testent.Foo) testent.FooID { return f.ID },
+	ID: func(f testent.Foo) *testent.FooID { return &f.ID },
 }
 
 func MakeContext(testing.TB) context.Context { return context.Background() }
@@ -120,21 +119,13 @@ func DatabaseDSN(tb testing.TB) string {
 	return u
 }
 
-type EntityID string
+type EntityID int
 
 type Entity struct {
 	ID  EntityID `ext:"ID"`
 	Foo string
 	Bar string
 	Baz string
-}
-
-func MakeEntityFunc(tb testing.TB) func() Entity {
-	return func() Entity {
-		te := tb.(*testcase.T).Random.Make(Entity{}).(Entity)
-		te.ID = ""
-		return te
-	}
 }
 
 type EntityDTO struct {
@@ -144,33 +135,21 @@ type EntityDTO struct {
 	Baz string   `json:"baz"`
 }
 
-type EntityJSONMapping struct{}
-
-func (n EntityJSONMapping) ToDTO(ent Entity) (EntityDTO, error) {
-	return EntityDTO{ID: ent.ID, Foo: ent.Foo, Bar: ent.Bar, Baz: ent.Baz}, nil
-}
-
-func (n EntityJSONMapping) ToEnt(dto EntityDTO) (Entity, error) {
-	return Entity{ID: dto.ID, Foo: dto.Foo, Bar: dto.Bar, Baz: dto.Baz}, nil
-}
-
 func EntityMapping() flsql.Mapping[Entity, EntityID] {
 	var (
 		idc int = 1
 		m   sync.Mutex
-		rnd = random.New(random.CryptoSeed{})
 	)
 	var newID = func() EntityID {
 		m.Lock()
 		defer m.Unlock()
 		idc++
-		rndstr := rnd.StringNWithCharset(8, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-		return EntityID(fmt.Sprintf("%d-%s", idc, rndstr))
+		return EntityID(idc)
 	}
 	return flsql.Mapping[Entity, EntityID]{
 		TableName: "test_entities",
 
-		ToID: func(id EntityID) (map[flsql.ColumnName]any, error) {
+		QueryID: func(id EntityID) (map[flsql.ColumnName]any, error) {
 			return map[flsql.ColumnName]any{"id": id}, nil
 		},
 
@@ -185,8 +164,8 @@ func EntityMapping() flsql.Mapping[Entity, EntityID] {
 
 		ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[Entity]) {
 			return []flsql.ColumnName{`id`, `foo`, `bar`, `baz`},
-				func(v *Entity, scan flsql.ScanFunc) error {
-					return scan(&v.ID, &v.Foo, &v.Bar, &v.Baz)
+				func(v *Entity, s flsql.Scanner) error {
+					return s.Scan(&v.ID, &v.Foo, &v.Bar, &v.Baz)
 				}
 		},
 
@@ -214,10 +193,10 @@ func MigrateEntity(tb testing.TB, cm flsql.Connection) {
 
 const testMigrateUP = `
 CREATE TABLE test_entities (
-    id  VARCHAR(255) NOT NULL PRIMARY KEY,
-    foo LONGTEXT     NOT NULL,
-    bar LONGTEXT     NOT NULL,
-    baz LONGTEXT     NOT NULL
+    id  INT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    foo LONGTEXT NOT NULL,
+    bar LONGTEXT NOT NULL,
+    baz LONGTEXT NOT NULL
 );
 `
 

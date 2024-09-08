@@ -10,6 +10,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"go.llib.dev/frameless/pkg/contextkit"
 	"go.llib.dev/frameless/pkg/errorkit"
 	"go.llib.dev/frameless/pkg/flsql"
 	"go.llib.dev/frameless/pkg/logger"
@@ -47,7 +48,7 @@ func Connect(dsn string) (Connection, error) {
 
 // Repository implements CRUD operations for a specific entity type in MySQL.
 type Repository[Entity, ID any] struct {
-	Connection flsql.Connection
+	Connection Connection
 	Mapping    flsql.Mapping[Entity, ID]
 }
 
@@ -55,19 +56,20 @@ func (r Repository[Entity, ID]) Create(ctx context.Context, ptr *Entity) (rErr e
 	if ptr == nil {
 		return fmt.Errorf("nil entity pointer given to Create")
 	}
-
 	ctx, err := r.BeginTx(ctx)
 	if err != nil {
 		return err
 	}
+	// this will ensure that either commit or rollback is called on the transaction,
+	// depending on the value of "rErr".
 	defer comproto.FinishOnePhaseCommit(&rErr, r, ctx)
 
 	if err := r.Mapping.OnCreate(ctx, ptr); err != nil {
 		return err
 	}
 
-	id, ok := r.Mapping.LookupID(*ptr)
-	if ok {
+	id, isIDOK := r.Mapping.LookupID(*ptr)
+	if isIDOK {
 		_, found, err := r.FindByID(ctx, id)
 		if err != nil {
 			return err
@@ -91,17 +93,24 @@ func (r Repository[Entity, ID]) Create(ctx context.Context, ptr *Entity) (rErr e
 		valueClause[i] = "?"
 	}
 
-	query := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)",
+	rcolumns, mapscan := r.Mapping.ToQuery(contextkit.WithoutValues(ctx))
+
+	query := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s) RETURNING %s",
 		r.Mapping.TableName,
 		flsql.JoinColumnName(cols, ", ", "`%s`"),
 		strings.Join(valueClause, ", "),
+		flsql.JoinColumnName(rcolumns, ", ", "`%s`"),
 	)
 
 	logger.Debug(ctx, "executing create SQL", logging.Field("query", query))
 
-	if _, err := r.Connection.ExecContext(ctx, query, valuesArgs...); err != nil {
+	row := r.Connection.QueryRowContext(ctx, query, valuesArgs...)
+
+	var got Entity
+	if err := mapscan(&got, row); err != nil {
 		return err
 	}
+	*ptr = got
 
 	return nil
 }
@@ -109,7 +118,7 @@ func (r Repository[Entity, ID]) Create(ctx context.Context, ptr *Entity) (rErr e
 func (r Repository[Entity, ID]) FindByID(ctx context.Context, id ID) (Entity, bool, error) {
 	var queryArgs []any
 
-	idArgs, err := r.Mapping.ToID(id)
+	idArgs, err := r.Mapping.QueryID(id)
 	if err != nil {
 		return *new(Entity), false, err
 	}
@@ -131,7 +140,7 @@ func (r Repository[Entity, ID]) FindByID(ctx context.Context, id ID) (Entity, bo
 	row := r.Connection.QueryRowContext(ctx, query, queryArgs...)
 
 	var v Entity
-	err = scan(&v, row.Scan)
+	err = scan(&v, row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return *new(Entity), false, nil
 	}
@@ -160,7 +169,7 @@ func (r Repository[Entity, ID]) DeleteAll(ctx context.Context) (rErr error) {
 }
 
 func (r Repository[Entity, ID]) DeleteByID(ctx context.Context, id ID) (rErr error) {
-	idArgs, err := r.Mapping.ToID(id)
+	idArgs, err := r.Mapping.QueryID(id)
 	if err != nil {
 		return err
 	}
@@ -200,7 +209,7 @@ func (r Repository[Entity, ID]) Update(ctx context.Context, ptr *Entity) (rErr e
 		return fmt.Errorf("missing entity ID for Update")
 	}
 
-	idArgs, err := r.Mapping.ToID(id)
+	idArgs, err := r.Mapping.QueryID(id)
 	if err != nil {
 		return err
 	}
@@ -238,6 +247,15 @@ func (r Repository[Entity, ID]) Update(ctx context.Context, ptr *Entity) (rErr e
 		return crud.ErrNotFound
 	}
 
+	got, found, err := r.FindByID(ctx, id)
+	if err != nil {
+		return fmt.Errorf("error while looking up the entity: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("expected that updated entity is findable")
+	}
+	*ptr = got
+
 	return nil
 }
 
@@ -264,7 +282,7 @@ func (r Repository[Entity, ID]) FindByIDs(ctx context.Context, ids ...ID) iterat
 	)
 
 	for _, id := range ids {
-		idArgs, err := r.Mapping.ToID(id)
+		idArgs, err := r.Mapping.QueryID(id)
 		if err != nil {
 			return iterators.Error[Entity](err)
 		}
@@ -336,6 +354,13 @@ func (r Repository[Entity, ID]) Upsert(ctx context.Context, entities ...*Entity)
 			return fmt.Errorf("nil entity pointer given to Upsert")
 		}
 
+		if _, ok := r.Mapping.LookupID(*ptr); !ok && r.Mapping.CreatePrepare != nil {
+			// if ID is not found, we assume it was never created before, so create peparation is required.
+			if err := r.Mapping.CreatePrepare(ctx, ptr); err != nil {
+				return err
+			}
+		}
+
 		// Prepare the entity's arguments
 		args, err := r.Mapping.ToArgs(*ptr)
 		if err != nil {
@@ -351,13 +376,16 @@ func (r Repository[Entity, ID]) Upsert(ctx context.Context, entities ...*Entity)
 		// Prepare update clause for ON DUPLICATE KEY UPDATE
 		updateClause := strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return fmt.Sprintf("`%s` = VALUES(`%s`)", c, c) }), ", ")
 
+		rcolumns, mapscan := r.Mapping.ToQuery(contextkit.WithoutValues(ctx))
+
 		// Construct the UPSERT query
 		query := fmt.Sprintf(
-			"INSERT INTO `%s` (`%s`) VALUES (%s) ON DUPLICATE KEY UPDATE %s",
+			"INSERT INTO `%s` (`%s`) VALUES (%s) ON DUPLICATE KEY UPDATE %s RETURNING %s",
 			r.Mapping.TableName,
 			strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return string(c) }), "`, `"),
 			strings.Join(valuesClause, ", "),
 			updateClause,
+			flsql.JoinColumnName(rcolumns, ", ", "`%s`"),
 		)
 
 		logger.Debug(ctx, "mysql Repository Upsert", logging.Fields{
@@ -366,7 +394,7 @@ func (r Repository[Entity, ID]) Upsert(ctx context.Context, entities ...*Entity)
 		})
 
 		// Execute the query
-		if _, err := r.Connection.ExecContext(ctx, query, values...); err != nil {
+		if err := mapscan(ptr, r.Connection.QueryRowContext(ctx, query, values...)); err != nil {
 			return err
 		}
 	}
