@@ -2,19 +2,24 @@ package mysql_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"go.llib.dev/frameless/adapter/mysql"
+	"go.llib.dev/frameless/adapter/mysql/internal/queries"
+	"go.llib.dev/frameless/pkg/cache/cachecontracts"
+	"go.llib.dev/frameless/pkg/dtokit"
+	"go.llib.dev/frameless/pkg/logger"
 	"go.llib.dev/frameless/port/crud/crudcontracts"
+	"go.llib.dev/frameless/port/migration"
+	"go.llib.dev/frameless/port/migration/migrationcontracts"
+	"go.llib.dev/frameless/spechelper/testent"
 	"go.llib.dev/testcase"
 	"go.llib.dev/testcase/assert"
 )
 
 func TestRepository(t *testing.T) {
-	cm, err := mysql.Connect(DatabaseDSN(t))
-	assert.NoError(t, err)
-	assert.NoError(t, cm.DB.Ping())
-	t.Cleanup(func() { assert.NoError(t, cm.Close()) })
+	cm := GetConnection(t)
 
 	subject := &mysql.Repository[Entity, EntityID]{
 		Connection: cm,
@@ -39,77 +44,81 @@ func TestRepository(t *testing.T) {
 	)
 }
 
-func TestRepository_Create_id(t *testing.T) {
-	cm, err := mysql.Connect(DatabaseDSN(t))
-	assert.NoError(t, err)
-	assert.NoError(t, cm.DB.Ping())
-	t.Cleanup(func() { assert.NoError(t, cm.Close()) })
-
-	mapping := EntityMapping()
-	mapping.CreatePrepare = nil // no ID injection to ensure that ID is set by the DB
-
-	subject := &mysql.Repository[Entity, EntityID]{
-		Connection: cm,
-		Mapping:    mapping,
+func TestCacheRepository(t *testing.T) {
+	// logger.Testing(t)
+	subject := mysql.CacheRepository[testent.Foo, testent.FooID]{
+		Connection: GetConnection(t),
+		ID:         "foo",
+		JSONDTOM:   testent.FooJSONMapping(),
+		IDA: func(f *testent.Foo) *testent.FooID {
+			return &f.ID
+		},
+		IDM: dtokit.Mapping[testent.FooID, string]{
+			ToENT: func(ctx context.Context, dto string) (testent.FooID, error) {
+				return testent.FooID(dto), nil
+			},
+			ToDTO: func(ctx context.Context, ent testent.FooID) (string, error) {
+				return ent.String(), nil
+			},
+		},
 	}
-
-	MigrateEntity(t, cm)
-
-	ctx := context.Background()
-	ent := Entity{
-		Foo: rnd.String(),
-		Bar: rnd.String(),
-		Baz: rnd.String(),
+	assert.NoError(t, subject.Migrate(context.Background()))
+	c := cachecontracts.Config[testent.Foo, testent.FooID]{
+		CRUD: crudcontracts.Config[testent.Foo, testent.FooID]{
+			MakeEntity: func(tb testing.TB) testent.Foo {
+				foo := testent.MakeFoo(tb)
+				foo.ID = testent.FooID(testcase.ToT(&tb).Random.UUID())
+				return foo
+			},
+		},
 	}
-
-	assert.NoError(t, subject.Create(ctx, &ent))
-	assert.NotEmpty(t, ent.ID, "it was expected that ID is set by the Create method")
-
-	got, found, err := subject.FindByID(ctx, ent.ID)
-	assert.NoError(t, err)
-	assert.True(t, found)
-	assert.Equal(t, got, ent)
+	cachecontracts.Repository(subject, c).Test(t)
 }
 
-func TestRepository_Upsert_id(t *testing.T) {
-	cm, err := mysql.Connect(DatabaseDSN(t))
-	assert.NoError(t, err)
-	assert.NoError(t, cm.DB.Ping())
-	t.Cleanup(func() { assert.NoError(t, cm.Close()) })
-
-	mapping := EntityMapping()
-	mapping.CreatePrepare = nil // no ID injection to ensure that ID is set by the DB
-
-	subject := &mysql.Repository[Entity, EntityID]{
-		Connection: cm,
-		Mapping:    mapping,
-	}
-
-	MigrateEntity(t, cm)
-
+func TestMigrationStateRepository(t *testing.T) {
+	logger.Testing(t)
 	ctx := context.Background()
-	ent1 := Entity{
-		Foo: rnd.String(),
-		Bar: rnd.String(),
-		Baz: rnd.String(),
-	}
-	ent2 := Entity{
-		Foo: rnd.String(),
-		Bar: rnd.String(),
-		Baz: rnd.String(),
+	conn := GetConnection(t)
+
+	repo := mysql.MakeMigrationStateRepository(conn)
+	repo.Mapping.TableName += "_test"
+
+	_, err := conn.ExecContext(ctx, fmt.Sprintf(queries.CreateTableSchemaMigrationsTmpl, repo.Mapping.TableName))
+	assert.NoError(t, err)
+	t.Cleanup(func() { _, _ = conn.ExecContext(ctx, fmt.Sprintf(queries.DropTableTmpl, repo.Mapping.TableName)) })
+
+	migrationcontracts.StateRepository(repo).Test(t)
+}
+
+func TestMigrationStateRepository_smoke(t *testing.T) {
+	logger.Testing(t)
+	ctx := context.Background()
+	conn := GetConnection(t)
+
+	repo := mysql.MakeMigrationStateRepository(conn)
+	repo.Mapping.TableName += "_test"
+
+	_, err := conn.ExecContext(ctx, fmt.Sprintf(queries.CreateTableSchemaMigrationsTmpl, repo.Mapping.TableName))
+	assert.NoError(t, err)
+	t.Cleanup(func() { _, _ = conn.ExecContext(ctx, fmt.Sprintf(queries.DropTableTmpl, repo.Mapping.TableName)) })
+
+	ent1 := migration.State{
+		ID: migration.StateID{
+			Namespace: "ns",
+			Version:   "0",
+		},
+		Dirty: false,
 	}
 
-	assert.NoError(t, subject.Upsert(ctx, &ent1, &ent2))
-	assert.NotEmpty(t, ent1.ID)
-	assert.NotEmpty(t, ent2.ID)
+	assert.NoError(t, repo.Create(ctx, &ent1))
 
-	got1, found, err := subject.FindByID(ctx, ent1.ID)
+	gotEnt1, found, err := repo.FindByID(ctx, ent1.ID)
 	assert.NoError(t, err)
 	assert.True(t, found)
-	assert.Equal(t, got1, ent1)
+	assert.Equal(t, gotEnt1, ent1)
 
-	got2, found, err := subject.FindByID(ctx, ent2.ID)
-	assert.NoError(t, err)
-	assert.True(t, found)
-	assert.Equal(t, got2, ent2)
+	assert.NoError(t, repo.DeleteByID(ctx, ent1.ID))
+
+	assert.NoError(t, repo.Create(ctx, &ent1))
+	assert.NoError(t, repo.DeleteAll(ctx))
 }

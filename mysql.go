@@ -10,15 +10,21 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"go.llib.dev/frameless/adapter/mysql/internal/queries"
+	"go.llib.dev/frameless/pkg/cache"
 	"go.llib.dev/frameless/pkg/contextkit"
+	"go.llib.dev/frameless/pkg/dtokit"
 	"go.llib.dev/frameless/pkg/errorkit"
 	"go.llib.dev/frameless/pkg/flsql"
 	"go.llib.dev/frameless/pkg/logger"
 	"go.llib.dev/frameless/pkg/logging"
 	"go.llib.dev/frameless/pkg/slicekit"
+	"go.llib.dev/frameless/pkg/zerokit"
 	"go.llib.dev/frameless/port/comproto"
 	"go.llib.dev/frameless/port/crud"
+	"go.llib.dev/frameless/port/crud/extid"
 	"go.llib.dev/frameless/port/iterators"
+	"go.llib.dev/frameless/port/migration"
 )
 
 type Connection = flsql.ConnectionAdapter[*sql.DB, *sql.Tx]
@@ -68,8 +74,8 @@ func (r Repository[Entity, ID]) Create(ctx context.Context, ptr *Entity) (rErr e
 		return err
 	}
 
-	id, isIDOK := r.Mapping.LookupID(*ptr)
-	if isIDOK {
+	id, ok := r.Mapping.ID.Lookup(*ptr)
+	if ok {
 		_, found, err := r.FindByID(ctx, id)
 		if err != nil {
 			return err
@@ -97,9 +103,9 @@ func (r Repository[Entity, ID]) Create(ctx context.Context, ptr *Entity) (rErr e
 
 	query := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s) RETURNING %s",
 		r.Mapping.TableName,
-		flsql.JoinColumnName(cols, ", ", "`%s`"),
+		flsql.JoinColumnName(cols, "`%s`", ", "),
 		strings.Join(valueClause, ", "),
-		flsql.JoinColumnName(rcolumns, ", ", "`%s`"),
+		flsql.JoinColumnName(rcolumns, "`%s`", ", "),
 	)
 
 	logger.Debug(ctx, "executing create SQL", logging.Field("query", query))
@@ -125,16 +131,13 @@ func (r Repository[Entity, ID]) FindByID(ctx context.Context, id ID) (Entity, bo
 
 	cols, scan := r.Mapping.ToQuery(ctx)
 
-	var idWhereClause []string
-	for col, arg := range idArgs {
-		idWhereClause = append(idWhereClause, fmt.Sprintf("`%s` = ?", col))
-		queryArgs = append(queryArgs, arg)
-	}
+	idWhereClauseCols, idWhereClauseArgs := flsql.SplitArgs(idArgs)
+	queryArgs = append(queryArgs, idWhereClauseArgs...)
 
-	query := fmt.Sprintf("SELECT %s FROM `%s` WHERE %s",
-		flsql.JoinColumnName(cols, ", ", "`%s`"),
+	query := fmt.Sprintf("SELECT %s FROM `%s` WHERE %s LIMIT 1",
+		flsql.JoinColumnName(cols, "`%s`", ", "),
 		r.Mapping.TableName,
-		strings.Join(idWhereClause, ", "),
+		flsql.JoinColumnName(idWhereClauseCols, "`%s` = ?", " AND "),
 	)
 
 	row := r.Connection.QueryRowContext(ctx, query, queryArgs...)
@@ -174,9 +177,11 @@ func (r Repository[Entity, ID]) DeleteByID(ctx context.Context, id ID) (rErr err
 		return err
 	}
 
+	whereClauseQuery, whereClauseArgs := r.buildWhereClause(idArgs)
+
 	query := fmt.Sprintf("DELETE FROM `%s` WHERE %s",
 		r.Mapping.TableName,
-		r.buildWhereClause(idArgs),
+		whereClauseQuery,
 	)
 
 	ctx, err = r.BeginTx(ctx)
@@ -185,7 +190,7 @@ func (r Repository[Entity, ID]) DeleteByID(ctx context.Context, id ID) (rErr err
 	}
 	defer comproto.FinishOnePhaseCommit(&rErr, r, ctx)
 
-	result, err := r.Connection.ExecContext(ctx, query, r.getArgsFromMap(idArgs)...)
+	result, err := r.Connection.ExecContext(ctx, query, whereClauseArgs...)
 	if err != nil {
 		return err
 	}
@@ -204,7 +209,7 @@ func (r Repository[Entity, ID]) Update(ctx context.Context, ptr *Entity) (rErr e
 		return fmt.Errorf("nil entity pointer received in Update")
 	}
 
-	id, ok := r.Mapping.LookupID(*ptr)
+	id, ok := r.Mapping.ID.Lookup(*ptr)
 	if !ok {
 		return fmt.Errorf("missing entity ID for Update")
 	}
@@ -220,14 +225,14 @@ func (r Repository[Entity, ID]) Update(ctx context.Context, ptr *Entity) (rErr e
 	}
 
 	cols, values := flsql.SplitArgs(setArgs)
-	whereClause := r.buildWhereClause(idArgs)
-	args := append(values, r.getArgsFromMap(idArgs)...)
+	whereClauseQuery, whereClauseArgs := r.buildWhereClause(idArgs)
+	args := append(values, whereClauseArgs...)
 
 	// Corrected part: Removed the `setClause` variable and directly inserted the mapped columns into the query.
 	query := fmt.Sprintf("UPDATE `%s` SET %s WHERE %s",
 		r.Mapping.TableName,
-		strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return fmt.Sprintf("`%s` = ?", c) }), ", "),
-		whereClause,
+		flsql.JoinColumnName(cols, "`%s` = ?", ", "),
+		whereClauseQuery,
 	)
 
 	ctx, err = r.BeginTx(ctx)
@@ -263,7 +268,7 @@ func (r Repository[Entity, ID]) FindAll(ctx context.Context) iterators.Iterator[
 	cols, scan := r.Mapping.ToQuery(ctx)
 
 	query := fmt.Sprintf("SELECT %s FROM `%s`",
-		flsql.JoinColumnName(cols, ", ", "`%s`"),
+		flsql.JoinColumnName(cols, "`%s`", ", "),
 		r.Mapping.TableName,
 	)
 
@@ -286,8 +291,9 @@ func (r Repository[Entity, ID]) FindByIDs(ctx context.Context, ids ...ID) iterat
 		if err != nil {
 			return iterators.Error[Entity](err)
 		}
-		whereClauses = append(whereClauses, fmt.Sprintf("(%s)", r.buildWhereClause(idArgs)))
-		queryArgs = append(queryArgs, r.getArgsFromMap(idArgs)...)
+		whereClauseQuery, whereClauseArgs := r.buildWhereClause(idArgs)
+		whereClauses = append(whereClauses, fmt.Sprintf("(%s)", whereClauseQuery))
+		queryArgs = append(queryArgs, whereClauseArgs...)
 	}
 
 	cols, scan := r.Mapping.ToQuery(ctx)
@@ -321,20 +327,9 @@ func (r Repository[Entity, ID]) RollbackTx(ctx context.Context) error {
 	return r.Connection.RollbackTx(ctx)
 }
 
-func (r Repository[Entity, ID]) buildWhereClause(args map[flsql.ColumnName]interface{}) string {
-	var whereClauses []string
-	for col := range args {
-		whereClauses = append(whereClauses, fmt.Sprintf("`%s` = ?", col))
-	}
-	return strings.Join(whereClauses, " AND ")
-}
-
-func (r Repository[Entity, ID]) getArgsFromMap(args map[flsql.ColumnName]interface{}) []interface{} {
-	values := make([]interface{}, 0, len(args))
-	for _, value := range args {
-		values = append(values, value)
-	}
-	return values
+func (r Repository[Entity, ID]) buildWhereClause(qargs flsql.QueryArgs) (string, []any) {
+	cols, args := flsql.SplitArgs(qargs)
+	return flsql.JoinColumnName(cols, "`%s` = ?", " AND "), args
 }
 
 // Upsert inserts new entities or updates existing ones if they already exist.
@@ -354,7 +349,7 @@ func (r Repository[Entity, ID]) Upsert(ctx context.Context, entities ...*Entity)
 			return fmt.Errorf("nil entity pointer given to Upsert")
 		}
 
-		if _, ok := r.Mapping.LookupID(*ptr); !ok && r.Mapping.CreatePrepare != nil {
+		if _, ok := r.Mapping.ID.Lookup(*ptr); !ok && r.Mapping.CreatePrepare != nil {
 			// if ID is not found, we assume it was never created before, so create peparation is required.
 			if err := r.Mapping.CreatePrepare(ctx, ptr); err != nil {
 				return err
@@ -385,7 +380,7 @@ func (r Repository[Entity, ID]) Upsert(ctx context.Context, entities ...*Entity)
 			strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return string(c) }), "`, `"),
 			strings.Join(valuesClause, ", "),
 			updateClause,
-			flsql.JoinColumnName(rcolumns, ", ", "`%s`"),
+			flsql.JoinColumnName(rcolumns, "`%s`", ", "),
 		)
 
 		logger.Debug(ctx, "mysql Repository Upsert", logging.Fields{
@@ -411,4 +406,260 @@ func Timestamp(ptr *time.Time) flsql.DTO {
 
 func JSON[T any](ptr *T) flsql.DTO {
 	return flsql.JSON[T](ptr)
+}
+
+// CacheRepository is a generic implementation for using mysql as a caching backend with `frameless/pkg/cache.Cache`.
+// CacheRepository implements `cache.Repository[ENT,ID]`
+type CacheRepository[ENT, ID any] struct {
+	Connection Connection
+	// ID [required] is unique identifier.  the table name prefix used to create the cache repository tables.
+	//
+	// Example:
+	// 		ID: "foo"
+	// 			-> "foo_cache_entities"
+	//
+	ID string
+	// JSONDTOM [optional] is the mapping between an ENT type and a JSON DTO type,
+	// which is used to encode entities within the entity repository.
+	// This mapping is important because if the entity type changes during refactoring,
+	// the previously cached data can still be correctly decoded using the JSON DTO.
+	// This means you won’t need to delete cached data or worry about data corruption.
+	// It provides a safeguard, ensuring smooth transitions without affecting stored data.
+	JSONDTOM dtokit.Mapper[ENT]
+	// IDA is the ID accessor, that explains how the ID field of the ENT can be accessed.
+	IDA extid.Accessor[ENT, ID]
+	// IDM is the mapping between ID and the string type which is used in the CacheRepository tables to represent the ID value.
+	// If the ID is a string type, then this field can be ignored.
+	IDM dtokit.MapperTo[ID, string]
+}
+
+func (r CacheRepository[ENT, ID]) getIDM() dtokit.MapperTo[ID, string] {
+	if r.IDM != nil {
+		return r.IDM
+	}
+	// fallback mapping logic
+	return dtokit.Mapping[ID, string]{}
+}
+
+func (r CacheRepository[ENT, ID]) tableName(name string) string {
+	var prefix = r.ID
+	if prefix == "" {
+		const format = "implementation error: missing CacheRepository.ID field (%#v)"
+		panic(fmt.Errorf(format, r))
+	}
+	return strings.Join([]string{prefix, "cache", name}, "_")
+}
+
+func (r CacheRepository[ENT, ID]) tableNameEntities() string {
+	return r.tableName("entities")
+}
+
+func (r CacheRepository[ENT, ID]) tableNameHits() string {
+	return r.tableName("hits")
+}
+
+func (r CacheRepository[ENT, ID]) jsonDTOM() dtokit.Mapper[ENT] {
+	return zerokit.Coalesce[dtokit.Mapper[ENT]](r.JSONDTOM, dtokit.Mapping[ENT, ENT]{})
+}
+
+func (r CacheRepository[ENT, ID]) BeginTx(ctx context.Context) (context.Context, error) {
+	return r.Connection.BeginTx(ctx)
+}
+
+func (r CacheRepository[ENT, ID]) CommitTx(ctx context.Context) error {
+	return r.Connection.CommitTx(ctx)
+}
+
+func (r CacheRepository[ENT, ID]) RollbackTx(ctx context.Context) error {
+	return r.Connection.RollbackTx(ctx)
+}
+
+func (r CacheRepository[ENT, ID]) Migrate(ctx context.Context) error {
+	entitiesTableName := r.tableNameEntities()
+	hitsTableName := r.tableNameHits()
+	m := MakeMigrator(r.Connection, r.tableName("migration"), migration.Steps[Connection]{
+		"1": flsql.MigrationStep[Connection]{
+			UpQuery:   fmt.Sprintf(queries.CreateTableCacheEntitiesTmpl, entitiesTableName),
+			DownQuery: fmt.Sprintf(queries.DropTableTmpl, entitiesTableName),
+		},
+		"2": flsql.MigrationStep[Connection]{
+			UpQuery:   fmt.Sprintf(queries.CreateTableCacheHitsTmpl, hitsTableName),
+			DownQuery: fmt.Sprintf(queries.DropTableTmpl, hitsTableName),
+		},
+	})
+	return m.Migrate(ctx)
+}
+
+func (r CacheRepository[ENT, ID]) Entities() cache.EntityRepository[ENT, ID] {
+	return Repository[ENT, ID]{
+		Connection: r.Connection,
+		Mapping: flsql.Mapping[ENT, ID]{
+			TableName: r.tableNameEntities(),
+			ID:        r.IDA,
+			ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[ENT]) {
+				return []flsql.ColumnName{"id", "data"},
+					func(v *ENT, s flsql.Scanner) error {
+						if v == nil {
+							return fmt.Errorf("nil %T pointer given for scanning", v)
+						}
+						var (
+							idDTO      string
+							dataDTOPtr = r.jsonDTOM().NewiDTO()
+						)
+						if err := s.Scan(&idDTO, JSON(&dataDTOPtr)); err != nil {
+							return err
+						}
+						id, err := r.getIDM().MapToENT(ctx, idDTO)
+						if err != nil {
+							return err
+						}
+						ent, err := r.jsonDTOM().MapFromiDTOPtr(ctx, dataDTOPtr)
+						if err != nil {
+							return err
+						}
+						*v = ent
+						return r.IDA.Set(v, id)
+					}
+			},
+			QueryID: func(id ID) (flsql.QueryArgs, error) {
+				ctx := context.Background()
+				idDTO, err := r.getIDM().MapToDTO(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				return flsql.QueryArgs{"id": idDTO}, nil
+			},
+			ToArgs: func(e ENT) (flsql.QueryArgs, error) {
+				ctx := context.Background()
+				id, _ := r.IDA.Lookup(e)
+				idDTO, err := r.getIDM().MapToDTO(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				return flsql.QueryArgs{
+					"id":   idDTO,
+					"data": JSON(&e),
+				}, nil
+			},
+		},
+	}
+}
+
+func (r CacheRepository[ENT, ID]) Hits() cache.HitRepository[ID] {
+	return Repository[cache.Hit[ID], cache.HitID]{
+		Connection: r.Connection,
+		Mapping: flsql.Mapping[cache.Hit[ID], cache.HitID]{
+			TableName: r.tableNameHits(),
+			ID: func(h *cache.Hit[ID]) *string {
+				return &h.QueryID
+			},
+			ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[cache.Hit[ID]]) {
+				return []flsql.ColumnName{"query_id", "ent_ids", "timestamp"},
+					func(v *cache.Hit[ID], s flsql.Scanner) error {
+						if v == nil {
+							return fmt.Errorf("nil %T was given for scanning", v)
+						}
+						var idDTOs []string
+						if err := s.Scan(&v.QueryID, JSON(&idDTOs), Timestamp(&v.Timestamp)); err != nil {
+							return err
+						}
+						v.EntityIDs = nil
+						for _, idDTO := range idDTOs {
+							id, err := r.getIDM().MapToENT(ctx, idDTO)
+							if err != nil {
+								return err
+							}
+							v.EntityIDs = append(v.EntityIDs, id)
+						}
+						return nil
+					}
+			},
+			QueryID: func(id cache.HitID) (flsql.QueryArgs, error) {
+				return flsql.QueryArgs{"query_id": id}, nil
+			},
+			ToArgs: func(h cache.Hit[ID]) (flsql.QueryArgs, error) {
+				ctx := context.Background()
+				var idDTOs []string
+				for _, id := range h.EntityIDs {
+					idDTO, err := r.getIDM().MapToDTO(ctx, id)
+					if err != nil {
+						return nil, err
+					}
+					idDTOs = append(idDTOs, idDTO)
+				}
+				return flsql.QueryArgs{
+					"query_id":  h.QueryID,
+					"ent_ids":   JSON(&idDTOs),
+					"timestamp": Timestamp(&h.Timestamp),
+				}, nil
+			},
+			CreatePrepare: func(ctx context.Context, h *cache.Hit[ID]) error {
+				if h == nil {
+					return fmt.Errorf("nil %T was sent for %T.Hits().Create", h, r)
+				}
+				if h.QueryID == "" {
+					return fmt.Errorf("empty query id was given for %T", h)
+				}
+				return nil
+			},
+		},
+	}
+}
+
+// migration //
+
+func MakeMigrator(conn Connection, namespace string, steps migration.Steps[Connection]) migration.Migrator[Connection] {
+	return migration.Migrator[Connection]{
+		Namespace:       namespace,
+		Resource:        conn,
+		StateRepository: MakeMigrationStateRepository(conn),
+		EnsureStateRepository: func(ctx context.Context) error {
+			_, err := conn.ExecContext(ctx, fmt.Sprintf(queries.CreateTableSchemaMigrationsTmpl, tableNameSchemaMigrations))
+			return err
+		},
+		Steps: steps,
+	}
+}
+
+const tableNameSchemaMigrations = "frameless_schema_migrations"
+
+func MakeMigrationStateRepository(conn Connection) Repository[migration.State, migration.StateID] {
+	return Repository[migration.State, migration.StateID]{
+		Connection: conn,
+		Mapping: flsql.Mapping[migration.State, migration.StateID]{
+			TableName: "frameless_schema_migrations",
+			ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[migration.State]) {
+				return []flsql.ColumnName{"namespace", "version", "dirty"},
+					func(v *migration.State, s flsql.Scanner) error {
+						return s.Scan(&v.ID.Namespace, &v.ID.Version, &v.Dirty)
+					}
+			},
+			QueryID: func(id migration.StateID) (flsql.QueryArgs, error) {
+				return flsql.QueryArgs{
+					"namespace": id.Namespace,
+					"version":   id.Version,
+				}, nil
+			},
+
+			ToArgs: func(s migration.State) (flsql.QueryArgs, error) {
+				return flsql.QueryArgs{
+					"namespace": s.ID.Namespace,
+					"version":   s.ID.Version,
+					"dirty":     s.Dirty,
+				}, nil
+			},
+
+			CreatePrepare: func(ctx context.Context, s *migration.State) error {
+				if s.ID.Namespace == "" {
+					return fmt.Errorf("MigrationStateRepository requires a non-empty namespace for Create")
+				}
+				if s.ID.Version == "" {
+					return fmt.Errorf("MigrationStateRepository requires a non-empty version for Create")
+				}
+				return nil
+			},
+
+			ID: func(s *migration.State) *migration.StateID { return &s.ID },
+		},
+	}
 }

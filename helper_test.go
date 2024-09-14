@@ -17,21 +17,21 @@ import (
 )
 
 var (
-	Connection      mysql.Connection
+	_Connection     mysql.Connection
 	mutexConnection sync.Mutex
 )
 
 func GetConnection(tb testing.TB) mysql.Connection {
 	mutexConnection.Lock()
 	defer mutexConnection.Unlock()
-	if !zerokit.IsZero(Connection) {
-		return Connection
+	if zerokit.IsZero(_Connection) {
+		conn, err := mysql.Connect(DatabaseDSN(tb))
+		assert.NoError(tb, err)
+		assert.NotNil(tb, conn)
+		_Connection = conn
 	}
-	cm, err := mysql.Connect(DatabaseDSN(tb))
-	assert.NoError(tb, err)
-	assert.NotNil(tb, cm)
-	Connection = cm
-	return cm
+	assert.NoError(tb, _Connection.DB.Ping())
+	return _Connection
 }
 
 var rnd = random.New(random.CryptoSeed{})
@@ -75,17 +75,17 @@ var FooMapping = flsql.Mapping[testent.Foo, testent.FooID]{
 
 	ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[testent.Foo]) {
 		return []flsql.ColumnName{"id", "foo", "bar", "baz"},
-			func(f *testent.Foo, s flsql.Scanner) error {
-				return s.Scan(&f.ID, &f.Foo, &f.Bar, &f.Baz)
+			func(f *testent.Foo, sf flsql.Scanner) error {
+				return sf.Scan(&f.ID, &f.Foo, &f.Bar, &f.Baz)
 			}
 	},
 
-	QueryID: func(id testent.FooID) (map[flsql.ColumnName]any, error) {
-		return map[flsql.ColumnName]any{"id": id}, nil
+	QueryID: func(id testent.FooID) (flsql.QueryArgs, error) {
+		return flsql.QueryArgs{"id": id}, nil
 	},
 
-	ToArgs: func(f testent.Foo) (map[flsql.ColumnName]any, error) {
-		return map[flsql.ColumnName]any{
+	ToArgs: func(f testent.Foo) (flsql.QueryArgs, error) {
+		return flsql.QueryArgs{
 			"id":  f.ID,
 			"foo": f.Foo,
 			"bar": f.Bar,
@@ -100,7 +100,7 @@ var FooMapping = flsql.Mapping[testent.Foo, testent.FooID]{
 		return nil
 	},
 
-	ID: func(f testent.Foo) *testent.FooID { return &f.ID },
+	ID: func(f *testent.Foo) *testent.FooID { return &f.ID },
 }
 
 func MakeContext(testing.TB) context.Context { return context.Background() }
@@ -149,12 +149,12 @@ func EntityMapping() flsql.Mapping[Entity, EntityID] {
 	return flsql.Mapping[Entity, EntityID]{
 		TableName: "test_entities",
 
-		QueryID: func(id EntityID) (map[flsql.ColumnName]any, error) {
-			return map[flsql.ColumnName]any{"id": id}, nil
+		QueryID: func(id EntityID) (flsql.QueryArgs, error) {
+			return flsql.QueryArgs{"id": id}, nil
 		},
 
-		ToArgs: func(e Entity) (map[flsql.ColumnName]any, error) {
-			return map[flsql.ColumnName]any{
+		ToArgs: func(e Entity) (flsql.QueryArgs, error) {
+			return flsql.QueryArgs{
 				`id`:  e.ID,
 				`foo`: e.Foo,
 				`bar`: e.Bar,
@@ -164,8 +164,8 @@ func EntityMapping() flsql.Mapping[Entity, EntityID] {
 
 		ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[Entity]) {
 			return []flsql.ColumnName{`id`, `foo`, `bar`, `baz`},
-				func(v *Entity, s flsql.Scanner) error {
-					return s.Scan(&v.ID, &v.Foo, &v.Bar, &v.Baz)
+				func(v *Entity, scan flsql.Scanner) error {
+					return scan.Scan(&v.ID, &v.Foo, &v.Bar, &v.Baz)
 				}
 		},
 
