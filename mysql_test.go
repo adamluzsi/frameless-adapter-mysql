@@ -9,6 +9,7 @@ import (
 	"go.llib.dev/frameless/adapter/mysql/internal/queries"
 	"go.llib.dev/frameless/pkg/cache/cachecontracts"
 	"go.llib.dev/frameless/pkg/dtokit"
+	"go.llib.dev/frameless/pkg/flsql"
 	"go.llib.dev/frameless/pkg/logger"
 	"go.llib.dev/frameless/port/crud/crudcontracts"
 	"go.llib.dev/frameless/port/migration"
@@ -19,6 +20,8 @@ import (
 )
 
 func TestRepository(t *testing.T) {
+	logger.Testing(t)
+
 	cm := GetConnection(t)
 
 	subject := &mysql.Repository[Entity, EntityID]{
@@ -121,4 +124,57 @@ func TestMigrationStateRepository_smoke(t *testing.T) {
 
 	assert.NoError(t, repo.Create(ctx, &ent1))
 	assert.NoError(t, repo.DeleteAll(ctx))
+}
+
+func TestRepository_intIDDefaultBehaviourWithoutMapping(t *testing.T) {
+	logger.Testing(t)
+	ctx := context.Background()
+	conn := GetConnection(t)
+
+	const tableName = "test_auto_inc_id_table"
+	const CreateTableSQL = `CREATE TABLE IF NOT EXISTS %s ( id INT AUTO_INCREMENT, val TEXT, PRIMARY KEY (id) );`
+	_, err := conn.ExecContext(ctx, fmt.Sprintf(CreateTableSQL, tableName))
+	assert.NoError(t, err)
+	defer conn.ExecContext(ctx, fmt.Sprintf(queries.DropTableTmpl, tableName))
+
+	type E struct {
+		ID  int `ext:"id"`
+		Val string
+	}
+
+	repo := mysql.Repository[E, int]{
+		Connection: conn,
+		Mapping: flsql.Mapping[E, int]{
+			TableName: tableName,
+			ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[E]) {
+				return []flsql.ColumnName{"id", "val"},
+					func(v *E, s flsql.Scanner) error {
+						return s.Scan(&v.ID, &v.Val)
+					}
+			},
+			QueryID: func(id int) (flsql.QueryArgs, error) {
+				return flsql.QueryArgs{
+					"id": id,
+				}, nil
+			},
+			ToArgs: func(e E) (flsql.QueryArgs, error) {
+				return flsql.QueryArgs{
+					"id":  e.ID,
+					"val": e.Val,
+				}, nil
+			},
+			ID: func(e *E) *int {
+				return &e.ID
+			},
+		},
+	}
+
+	var v = E{Val: "42"}
+	assert.NoError(t, repo.Create(ctx, &v))
+	assert.NotEmpty(t, v.ID)
+
+	got, found, err := repo.FindByID(ctx, v.ID)
+	assert.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, got, v)
 }

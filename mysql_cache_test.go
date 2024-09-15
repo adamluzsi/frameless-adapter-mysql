@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"go.llib.dev/testcase"
 	"go.llib.dev/testcase/assert"
 	"go.llib.dev/testcase/random"
 
@@ -15,6 +16,7 @@ import (
 	"go.llib.dev/frameless/pkg/flsql"
 	"go.llib.dev/frameless/pkg/logger"
 	"go.llib.dev/frameless/pkg/zerokit"
+	"go.llib.dev/frameless/port/crud/crudcontracts"
 	"go.llib.dev/frameless/spechelper/testent"
 )
 
@@ -22,10 +24,20 @@ func TestRepository_cacheEntityRepository(t *testing.T) {
 	cm := GetConnection(t)
 	MigrateFooCache(t, cm)
 
+	conf := cachecontracts.Config[testent.Foo, testent.FooID]{
+		CRUD: crudcontracts.Config[testent.Foo, testent.FooID]{
+			MakeEntity: func(t testing.TB) testent.Foo {
+				f := testent.MakeFoo(t)
+				f.ID = testent.FooID(t.(*testcase.T).Random.UUID())
+				return f
+			},
+		},
+	}
+
 	cacheRepository := FooCacheRepository{Connection: cm}
-	cachecontracts.EntityRepository[testent.Foo, testent.FooID](cacheRepository.Entities(), cm)
+	cachecontracts.EntityRepository[testent.Foo, testent.FooID](cacheRepository.Entities(), cm, conf)
 	cachecontracts.HitRepository[testent.FooID](cacheRepository.Hits(), cm)
-	cachecontracts.Repository(cacheRepository).Test(t)
+	cachecontracts.Repository(cacheRepository, conf).Test(t)
 }
 
 func TestRepository_cacheHitRepository(t *testing.T) {

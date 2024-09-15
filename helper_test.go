@@ -110,7 +110,7 @@ func MakeString(tb testing.TB) string {
 }
 
 func DatabaseDSN(tb testing.TB) string {
-	const envKey = "MARIADB_DATABASE_DSN"
+	const envKey = "MYSQL_DATABASE_DSN"
 	u, ok, err := env.Lookup[string](envKey)
 	assert.NoError(tb, err)
 	if !ok {
