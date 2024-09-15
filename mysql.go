@@ -651,10 +651,10 @@ func MakeMigrationStateRepository(conn Connection) Repository[migration.State, m
 
 			CreatePrepare: func(ctx context.Context, s *migration.State) error {
 				if s.ID.Namespace == "" {
-					return fmt.Errorf("MigrationStateRepository requires a non-empty namespace for Create")
+					return fmt.Errorf("mysql.MigrationStateRepository requires a non-empty namespace for Create")
 				}
 				if s.ID.Version == "" {
-					return fmt.Errorf("MigrationStateRepository requires a non-empty version for Create")
+					return fmt.Errorf("mysql.MigrationStateRepository requires a non-empty version for Create")
 				}
 				return nil
 			},
