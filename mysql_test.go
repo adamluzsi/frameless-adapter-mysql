@@ -32,7 +32,9 @@ func TestRepository(t *testing.T) {
 	MigrateEntity(t, cm)
 
 	config := crudcontracts.Config[Entity, EntityID]{
-		MakeContext:     context.Background,
+		MakeContext: func(t testing.TB) context.Context {
+			return context.Background()
+		},
 		SupportIDReuse:  true,
 		SupportRecreate: true,
 		ChangeEntity:    nil, // test entity can be freely changed

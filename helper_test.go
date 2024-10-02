@@ -93,7 +93,7 @@ var FooMapping = flsql.Mapping[testent.Foo, testent.FooID]{
 		}, nil
 	},
 
-	CreatePrepare: func(ctx context.Context, f *testent.Foo) error {
+	Prepare: func(ctx context.Context, f *testent.Foo) error {
 		if zerokit.IsZero(f.ID) {
 			f.ID = testent.FooID(random.New(random.CryptoSeed{}).UUID())
 		}
@@ -169,7 +169,7 @@ func EntityMapping() flsql.Mapping[Entity, EntityID] {
 				}
 		},
 
-		CreatePrepare: func(ctx context.Context, e *Entity) error {
+		Prepare: func(ctx context.Context, e *Entity) error {
 			if zerokit.IsZero(e.ID) {
 				e.ID = newID()
 			}

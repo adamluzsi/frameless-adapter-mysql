@@ -3,8 +3,9 @@ module go.llib.dev/frameless/adapter/mysql
 go 1.21.5
 
 require (
-	filippo.io/edwards25519 v1.1.0 // indirect
-	github.com/go-sql-driver/mysql v1.8.1 // indirect
-	go.llib.dev/frameless v0.240.1 // indirect
-	go.llib.dev/testcase v0.160.0 // indirect
+	github.com/go-sql-driver/mysql v1.8.1
+	go.llib.dev/frameless v0.244.3
+	go.llib.dev/testcase v0.163.0
 )
+
+require filippo.io/edwards25519 v1.1.0 // indirect

@@ -27,7 +27,7 @@ import (
 )
 
 type Connection struct {
-	flsql.ConnectionAdapter[*sql.DB, *sql.Tx]
+	flsql.ConnectionAdapter[sql.DB, sql.Tx]
 }
 
 func Connect(dsn string) (Connection, error) {
@@ -79,7 +79,7 @@ func (r Repository[ENT, ID]) Create(ctx context.Context, ptr *ENT) (rErr error) 
 	// depending on the value of "rErr".
 	defer comproto.FinishOnePhaseCommit(&rErr, r, ctx)
 
-	if err := r.Mapping.OnCreate(ctx, ptr); err != nil {
+	if err := r.Mapping.OnPrepare(ctx, ptr); err != nil {
 		return err
 	}
 
@@ -294,7 +294,7 @@ func (r Repository[ENT, ID]) Update(ctx context.Context, ptr *ENT) (rErr error) 
 	return nil
 }
 
-func (r Repository[ENT, ID]) FindAll(ctx context.Context) iterators.Iterator[ENT] {
+func (r Repository[ENT, ID]) FindAll(ctx context.Context) (iterators.Iterator[ENT], error) {
 	cols, scan := r.Mapping.ToQuery(ctx)
 
 	query := fmt.Sprintf("SELECT %s FROM `%s`",
@@ -304,13 +304,13 @@ func (r Repository[ENT, ID]) FindAll(ctx context.Context) iterators.Iterator[ENT
 
 	rows, err := r.Connection.QueryContext(ctx, query)
 	if err != nil {
-		return iterators.Error[ENT](err)
+		return nil, err
 	}
 
-	return flsql.MakeSQLRowsIterator[ENT](rows, scan)
+	return flsql.MakeSQLRowsIterator[ENT](rows, scan), nil
 }
 
-func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) iterators.Iterator[ENT] {
+func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) (iterators.Iterator[ENT], error) {
 	var (
 		whereClauses []string
 		queryArgs    []interface{}
@@ -319,7 +319,7 @@ func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) iterators
 	for _, id := range ids {
 		idArgs, err := r.Mapping.QueryID(id)
 		if err != nil {
-			return iterators.Error[ENT](err)
+			return nil, err
 		}
 		whereClauseQuery, whereClauseArgs := r.buildWhereClause(idArgs)
 		whereClauses = append(whereClauses, fmt.Sprintf("(%s)", whereClauseQuery))
@@ -336,10 +336,10 @@ func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) iterators
 
 	rows, err := r.Connection.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
-		return iterators.Error[ENT](err)
+		return nil, err
 	}
 
-	return flsql.MakeSQLRowsIterator[ENT](rows, scan)
+	return flsql.MakeSQLRowsIterator[ENT](rows, scan), nil
 }
 
 // BeginTx implements the comproto.OnePhaseCommitter interface.
@@ -363,9 +363,9 @@ func (r Repository[ENT, ID]) buildWhereClause(qargs flsql.QueryArgs) (string, []
 }
 
 // Upsert inserts new entities or updates existing ones if they already exist.
-func (r Repository[ENT, ID]) Upsert(ctx context.Context, entities ...*ENT) (rErr error) {
-	if len(entities) == 0 {
-		return fmt.Errorf("no entities provided to Upsert")
+func (r Repository[ENT, ID]) Save(ctx context.Context, ptr *ENT) (rErr error) {
+	if ptr == nil {
+		return fmt.Errorf("nil entity pointer given to Upsert")
 	}
 
 	ctx, err := r.BeginTx(ctx)
@@ -374,63 +374,56 @@ func (r Repository[ENT, ID]) Upsert(ctx context.Context, entities ...*ENT) (rErr
 	}
 	defer comproto.FinishOnePhaseCommit(&rErr, r, ctx)
 
-	for _, ptr := range entities {
-		if ptr == nil {
-			return fmt.Errorf("nil entity pointer given to Upsert")
-		}
-
-		id, idOK := r.Mapping.ID.Lookup(*ptr)
-		if !idOK && r.Mapping.CreatePrepare != nil {
-			// if ID is not found, we assume it was never created before, so create peparation is required.
-			if err := r.Mapping.CreatePrepare(ctx, ptr); err != nil {
-				return err
-			}
-		}
-
-		// Prepare the entity's arguments
-		insertArgs, err := r.Mapping.ToArgs(*ptr)
-		if err != nil {
+	id, idOK := r.Mapping.ID.Lookup(*ptr)
+	if !idOK {
+		// if ID is not found, we assume it was never created before, so create peparation is required.
+		if err := r.Mapping.OnPrepare(ctx, ptr); err != nil {
 			return err
 		}
-
-		cols, args := flsql.SplitArgs(insertArgs)
-		valuesClause := make([]string, len(cols))
-		for i := range cols {
-			valuesClause[i] = "?"
-		}
-
-		// Prepare update clause for ON DUPLICATE KEY UPDATE
-		updateClause := strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return fmt.Sprintf("`%s` = VALUES(`%s`)", c, c) }), ", ")
-
-		// Construct the UPSERT query
-		query := fmt.Sprintf(
-			"INSERT INTO `%s` (`%s`) VALUES (%s) ON DUPLICATE KEY UPDATE %s",
-			r.Mapping.TableName,
-			strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return string(c) }), "`, `"),
-			strings.Join(valuesClause, ", "),
-			updateClause,
-		)
-
-		logger.Debug(ctx, "mysql Repository Upsert", logging.Fields{
-			"query": query,
-			"args":  args,
-		})
-
-		if _, err := r.Connection.ExecContext(ctx, query, args...); err != nil {
-			return err
-		}
-
-		got, found, err := r.FindByID(ctx, id)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("expected that %T entity exist after upsert (id=%v)", *new(ENT), id)
-		}
-
-		*ptr = got
-
 	}
+
+	// Prepare the entity's arguments
+	insertArgs, err := r.Mapping.ToArgs(*ptr)
+	if err != nil {
+		return err
+	}
+
+	cols, args := flsql.SplitArgs(insertArgs)
+	valuesClause := make([]string, len(cols))
+	for i := range cols {
+		valuesClause[i] = "?"
+	}
+
+	// Prepare update clause for ON DUPLICATE KEY UPDATE
+	updateClause := strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return fmt.Sprintf("`%s` = VALUES(`%s`)", c, c) }), ", ")
+
+	// Construct the UPSERT query
+	query := fmt.Sprintf(
+		"INSERT INTO `%s` (`%s`) VALUES (%s) ON DUPLICATE KEY UPDATE %s",
+		r.Mapping.TableName,
+		strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return string(c) }), "`, `"),
+		strings.Join(valuesClause, ", "),
+		updateClause,
+	)
+
+	logger.Debug(ctx, "mysql Repository Upsert", logging.Fields{
+		"query": query,
+		"args":  args,
+	})
+
+	if _, err := r.Connection.ExecContext(ctx, query, args...); err != nil {
+		return err
+	}
+
+	got, found, err := r.FindByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("expected that %T entity exist after upsert (id=%v)", *new(ENT), id)
+	}
+
+	*ptr = got
 
 	return nil
 }
@@ -588,8 +581,8 @@ func (r CacheRepository[ENT, ID]) Hits() cache.HitRepository[ID] {
 		Connection: r.Connection,
 		Mapping: flsql.Mapping[cache.Hit[ID], cache.HitID]{
 			TableName: r.tableNameHits(),
-			ID: func(h *cache.Hit[ID]) *string {
-				return &h.QueryID
+			ID: func(h *cache.Hit[ID]) *cache.HitID {
+				return &h.ID
 			},
 			ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[cache.Hit[ID]]) {
 				return []flsql.ColumnName{"query_id", "ent_ids", "timestamp"},
@@ -598,7 +591,7 @@ func (r CacheRepository[ENT, ID]) Hits() cache.HitRepository[ID] {
 							return fmt.Errorf("nil %T was given for scanning", v)
 						}
 						var idDTOs []string
-						if err := s.Scan(&v.QueryID, JSON(&idDTOs), Timestamp(&v.Timestamp)); err != nil {
+						if err := s.Scan(&v.ID, JSON(&idDTOs), Timestamp(&v.Timestamp)); err != nil {
 							return err
 						}
 						v.EntityIDs = nil
@@ -626,16 +619,16 @@ func (r CacheRepository[ENT, ID]) Hits() cache.HitRepository[ID] {
 					idDTOs = append(idDTOs, idDTO)
 				}
 				return flsql.QueryArgs{
-					"query_id":  h.QueryID,
+					"query_id":  h.ID,
 					"ent_ids":   JSON(&idDTOs),
 					"timestamp": Timestamp(&h.Timestamp),
 				}, nil
 			},
-			CreatePrepare: func(ctx context.Context, h *cache.Hit[ID]) error {
+			Prepare: func(ctx context.Context, h *cache.Hit[ID]) error {
 				if h == nil {
 					return fmt.Errorf("nil %T was sent for %T.Hits().Create", h, r)
 				}
-				if h.QueryID == "" {
+				if h.ID == "" {
 					return fmt.Errorf("empty query id was given for %T", h)
 				}
 				return nil
@@ -687,7 +680,7 @@ func MakeMigrationStateRepository(conn Connection) Repository[migration.State, m
 				}, nil
 			},
 
-			CreatePrepare: func(ctx context.Context, s *migration.State) error {
+			Prepare: func(ctx context.Context, s *migration.State) error {
 				if s.ID.Namespace == "" {
 					return fmt.Errorf("mysql.MigrationStateRepository requires a non-empty namespace for Create")
 				}

@@ -144,7 +144,7 @@ func (cr FooCacheRepository) Entities() cache.EntityRepository[testent.Foo, test
 				}, nil
 			},
 
-			CreatePrepare: func(ctx context.Context, f *testent.Foo) error {
+			Prepare: func(ctx context.Context, f *testent.Foo) error {
 				if zerokit.IsZero(f.ID) {
 					f.ID = testent.FooID(random.New(random.CryptoSeed{}).UUID())
 				}
@@ -164,13 +164,13 @@ func (cr FooCacheRepository) Hits() cache.HitRepository[testent.FooID] {
 		Mapping: flsql.Mapping[cache.Hit[testent.FooID], cache.HitID]{
 			TableName: "cache_foo_hits",
 
-			QueryID: func(id string) (flsql.QueryArgs, error) {
+			QueryID: func(id cache.HitID) (flsql.QueryArgs, error) {
 				return flsql.QueryArgs{"id": id}, nil
 			},
 
 			ToArgs: func(h cache.Hit[testent.FooID]) (flsql.QueryArgs, error) {
 				return flsql.QueryArgs{
-					"id":  h.QueryID,
+					"id":  h.ID,
 					"ids": mysql.JSON(&h.EntityIDs),
 					"ts":  mysql.Timestamp(&h.Timestamp),
 				}, nil
@@ -178,7 +178,7 @@ func (cr FooCacheRepository) Hits() cache.HitRepository[testent.FooID] {
 
 			ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[cache.Hit[testent.FooID]]) {
 				return []flsql.ColumnName{"id", "ids", "ts"}, func(v *cache.Hit[testent.FooID], s flsql.Scanner) error {
-					err := s.Scan(&v.QueryID, mysql.JSON(&v.EntityIDs), mysql.Timestamp(&v.Timestamp))
+					err := s.Scan(&v.ID, mysql.JSON(&v.EntityIDs), mysql.Timestamp(&v.Timestamp))
 					if err != nil {
 						return err
 					}
@@ -190,7 +190,7 @@ func (cr FooCacheRepository) Hits() cache.HitRepository[testent.FooID] {
 			},
 
 			ID: func(h *cache.Hit[testent.FooID]) *cache.HitID {
-				return &h.QueryID
+				return &h.ID
 			},
 		},
 		Connection: cr.Connection,
