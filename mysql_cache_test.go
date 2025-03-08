@@ -9,7 +9,6 @@ import (
 	"go.llib.dev/testcase/assert"
 	"go.llib.dev/testcase/random"
 
-	"go.llib.dev/frameless/adapter/memory"
 	"go.llib.dev/frameless/adapter/mysql"
 	"go.llib.dev/frameless/pkg/cache"
 	"go.llib.dev/frameless/pkg/cache/cachecontracts"
@@ -49,20 +48,12 @@ func TestRepository_cacheHitRepository(t *testing.T) {
 
 func TestRepository_cacheCache(t *testing.T) {
 	logger.Testing(t)
-
-	cm := GetConnection(t)
-	MigrateFooCache(t, cm)
-
-	src := memory.NewRepository[testent.Foo, testent.FooID](memory.NewMemory())
-	chcRepo := FooCacheRepository{Connection: cm}
-
-	chc := &cache.Cache[testent.Foo, testent.FooID]{
-		Source:                  src,
-		Repository:              chcRepo,
-		CachedQueryInvalidators: nil,
+	chcRepo := mysql.CacheRepository[testent.Foo, testent.FooID]{
+		Connection: GetConnection(t),
+		ID:         "foos",
 	}
-
-	cachecontracts.Cache[testent.Foo, testent.FooID](chc, src, chcRepo).Test(t)
+	assert.NoError(t, chcRepo.Migrate(t.Context()))
+	cachecontracts.Cache(chcRepo).Test(t)
 }
 
 func splitQuery(query string) []string {

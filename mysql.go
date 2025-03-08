@@ -15,6 +15,7 @@ import (
 	"go.llib.dev/frameless/pkg/dtokit"
 	"go.llib.dev/frameless/pkg/errorkit"
 	"go.llib.dev/frameless/pkg/flsql"
+	"go.llib.dev/frameless/pkg/iterkit"
 	"go.llib.dev/frameless/pkg/logger"
 	"go.llib.dev/frameless/pkg/logging"
 	"go.llib.dev/frameless/pkg/slicekit"
@@ -22,7 +23,6 @@ import (
 	"go.llib.dev/frameless/port/comproto"
 	"go.llib.dev/frameless/port/crud"
 	"go.llib.dev/frameless/port/crud/extid"
-	"go.llib.dev/frameless/port/iterators"
 	"go.llib.dev/frameless/port/migration"
 )
 
@@ -90,10 +90,8 @@ func (r Repository[ENT, ID]) Create(ctx context.Context, ptr *ENT) (rErr error) 
 			return err
 		}
 		if found {
-			return errorkit.With(crud.ErrAlreadyExists).
-				Detailf(`%T already exists with id: %v`, *new(ENT), id).
-				Context(ctx).
-				Unwrap()
+			err := crud.ErrAlreadyExists.F(`%T already exists with id: %v`, *new(ENT), id)
+			return errorkit.WithContext(err, ctx)
 		}
 	}
 
@@ -294,7 +292,7 @@ func (r Repository[ENT, ID]) Update(ctx context.Context, ptr *ENT) (rErr error) 
 	return nil
 }
 
-func (r Repository[ENT, ID]) FindAll(ctx context.Context) (iterators.Iterator[ENT], error) {
+func (r Repository[ENT, ID]) FindAll(ctx context.Context) (iterkit.ErrIter[ENT], error) {
 	cols, scan := r.Mapping.ToQuery(ctx)
 
 	query := fmt.Sprintf("SELECT %s FROM `%s`",
@@ -307,10 +305,10 @@ func (r Repository[ENT, ID]) FindAll(ctx context.Context) (iterators.Iterator[EN
 		return nil, err
 	}
 
-	return flsql.MakeSQLRowsIterator[ENT](rows, scan), nil
+	return flsql.MakeRowsIterator[ENT](rows, scan), nil
 }
 
-func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) (iterators.Iterator[ENT], error) {
+func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) (iterkit.ErrIter[ENT], error) {
 	var (
 		whereClauses []string
 		queryArgs    []interface{}
@@ -339,7 +337,7 @@ func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) (iterator
 		return nil, err
 	}
 
-	return flsql.MakeSQLRowsIterator[ENT](rows, scan), nil
+	return flsql.MakeRowsIterator[ENT](rows, scan), nil
 }
 
 // BeginTx implements the comproto.OnePhaseCommitter interface.
@@ -535,7 +533,7 @@ func (r CacheRepository[ENT, ID]) Entities() cache.EntityRepository[ENT, ID] {
 						}
 						var (
 							idDTO      string
-							dataDTOPtr = r.jsonDTOM().NewiDTO()
+							dataDTOPtr = r.jsonDTOM().NewDTO()
 						)
 						if err := s.Scan(&idDTO, JSON(&dataDTOPtr)); err != nil {
 							return err
@@ -544,7 +542,7 @@ func (r CacheRepository[ENT, ID]) Entities() cache.EntityRepository[ENT, ID] {
 						if err != nil {
 							return err
 						}
-						ent, err := r.jsonDTOM().MapFromiDTOPtr(ctx, dataDTOPtr)
+						ent, err := r.jsonDTOM().MapFromDTO(ctx, dataDTOPtr)
 						if err != nil {
 							return err
 						}
